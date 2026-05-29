@@ -388,7 +388,17 @@ class TaskService:
         if temp_file_paths:
             if upload_task.temp_file_paths is None:
                 upload_task.temp_file_paths = []
-            upload_task.temp_file_paths.extend(temp_file_paths)
+            normalized_temp_paths = [str(path) for path in temp_file_paths]
+            unknown_temp_paths = [
+                path for path in normalized_temp_paths if path not in upload_task.file_tasks
+            ]
+            if unknown_temp_paths:
+                logger.warning(
+                    "temp_file_paths do not match file_tasks keys; retry retention may fail",
+                    task_id=task_id,
+                    unknown_temp_paths=unknown_temp_paths,
+                )
+            upload_task.temp_file_paths.extend(normalized_temp_paths)
 
         # Start background processing
         background_task = asyncio.create_task(
@@ -594,20 +604,9 @@ class TaskService:
                 upload_task.status = TaskStatus.COMPLETED
                 upload_task.updated_at = time.time()
 
-            # Clean up temp files after all processing is complete
-            if hasattr(upload_task, "temp_file_paths") and upload_task.temp_file_paths:
-                from utils.file_utils import safe_unlink
-
-                for temp_path in upload_task.temp_file_paths:
-                    try:
-                        safe_unlink(temp_path)
-                        logger.debug("Cleaned up temp file", temp_path=temp_path)
-                    except Exception as cleanup_error:
-                        logger.warning(
-                            "Failed to clean up temp file after processing",
-                            temp_path=temp_path,
-                            error=str(cleanup_error),
-                        )
+            # Clean up upload temps that are not retryable; keep local RETRYABLE
+            # failures so retry can re-read the staged source file.
+            self._cleanup_upload_temp_files(upload_task)
 
             status: str = "FAILED"
 
@@ -1295,6 +1294,9 @@ class TaskService:
                     task.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]
                     and current_time - task.updated_at > max_age_seconds
                 ):
+                    # Task is leaving memory; reclaim any retained upload temps
+                    # (including RETRYABLE locals kept for in-flight retry).
+                    self._cleanup_upload_temp_files(task, force=True)
                     del self.task_store[user_id][task_id]
                     # Clean up the associated lock
                     self._task_locks.pop(task_id, None)
@@ -1368,7 +1370,79 @@ class TaskService:
                     file_task.error = "Task cancelled by user"
                     file_task.updated_at = time.time()
 
+        self._cleanup_upload_temp_files(upload_task, force=True)
+
         return True
+
+    def _file_task_for_temp_path(self, upload_task: UploadTask, temp_path: str) -> FileTask | None:
+        """Resolve the FileTask for a staged upload temp path."""
+        file_task = upload_task.file_tasks.get(temp_path)
+        if file_task is not None:
+            return file_task
+        for candidate in upload_task.file_tasks.values():
+            if candidate.file_path == temp_path:
+                return candidate
+        return None
+
+    def _is_retryable_local_upload_temp(self, upload_task: UploadTask, temp_path: str) -> bool:
+        """True when a staged temp belongs to a failed local RETRYABLE upload.
+
+        Local uploads use the staged path as the file_tasks key and
+        FileTask.file_path. When those diverge, this falls back to matching
+        FileTask.file_path. Unmapped absolute temps are retained (see
+        _should_retain_upload_temp) rather than deleted silently.
+        """
+        if not os.path.isabs(temp_path):
+            return False
+        file_task = self._file_task_for_temp_path(upload_task, temp_path)
+        if file_task is None or file_task.status != TaskStatus.FAILED:
+            return False
+        metadata = self._infer_failure_metadata(file_task)
+        return bool(metadata and metadata.get("actionable_by") == "RETRYABLE")
+
+    def _should_retain_upload_temp(self, upload_task: UploadTask, temp_path: str) -> bool:
+        """Return True when an upload temp should be kept after processing."""
+        if self._is_retryable_local_upload_temp(upload_task, temp_path):
+            return True
+        if (
+            os.path.isabs(temp_path)
+            and self._file_task_for_temp_path(upload_task, temp_path) is None
+        ):
+            logger.warning(
+                "Upload temp path has no matching file task; retaining staged file",
+                temp_path=temp_path,
+                task_id=upload_task.task_id,
+            )
+            return True
+        return False
+
+    def _cleanup_upload_temp_files(self, upload_task: UploadTask, *, force: bool = False) -> None:
+        """Remove staged upload temp files that are not retryable.
+
+        Keeps temps for failed local uploads classified as RETRYABLE so retry
+        can reuse the original source path. Use *force* to delete all temps
+        (e.g. user cancelled the task).
+        """
+        if not getattr(upload_task, "temp_file_paths", None):
+            return
+
+        from utils.file_utils import safe_unlink
+
+        retained: list[str] = []
+        for temp_path in upload_task.temp_file_paths:
+            if not force and self._should_retain_upload_temp(upload_task, temp_path):
+                retained.append(temp_path)
+                continue
+            safe_unlink(temp_path)
+            if os.path.exists(temp_path):
+                retained.append(temp_path)
+                logger.warning(
+                    "Failed to clean up temp file after processing",
+                    temp_path=temp_path,
+                )
+            else:
+                logger.debug("Cleaned up temp file", temp_path=temp_path)
+        upload_task.temp_file_paths = retained
 
     async def shutdown(self):
         """Cleanup process pool and cancel all background tasks
@@ -1377,7 +1451,8 @@ class TaskService:
         1. Cancelling the periodic cleanup task
         2. Cancelling all running background tasks
         3. Waiting for cancellation to complete
-        4. Shutting down the process pool
+        4. Force-cleaning staged upload temps for all tracked tasks
+        5. Shutting down the process pool
         """
         logger.info("Shutting down TaskService", background_tasks_count=len(self.background_tasks))
 
@@ -1403,3 +1478,7 @@ class TaskService:
                     logger.warning(
                         "Background task raised exception during shutdown", error=str(result)
                     )
+
+        for user_tasks in self.task_store.values():
+            for upload_task in user_tasks.values():
+                self._cleanup_upload_temp_files(upload_task, force=True)
